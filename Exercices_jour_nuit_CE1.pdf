@@ -1,0 +1,95 @@
+# Brancher l'interface web sur ton API
+
+L'interface `interface_agent.jsx` est une page React qui appelle **ton API** en
+**POST JSON** et attend en retour des **URLs de fichiers**. Voici le contrat exact.
+
+## Requête envoyée par l'interface
+
+`POST <ton-endpoint>` — en-tête `Content-Type: application/json` (ajoute ton auth
+dans `API_CONFIG.headers`). Corps :
+
+```json
+{
+  "discipline": "Questionner le monde",
+  "sequence": "Le jour et la nuit",
+  "niveau": "CE1",
+  "seances": 5,
+  "produits": ["prep", "exercices", "evaluation"],
+  "format": "PDF",
+  "typographie": "Script École",
+  "detail": "Détaillé",
+  "differenciation": "Complète",
+  "demande": "Crée une séquence « Le jour et la nuit » en CE1 (...)"
+}
+```
+
+Le champ **`demande`** est la phrase en langage naturel prête à passer à l'agent
+(`agent_runner.py`). Tu peux soit l'utiliser directement, soit te servir des champs
+structurés.
+
+## Réponse attendue par l'interface
+
+```json
+{
+  "fichiers": [
+    { "nom": "Fiche_preparation_jour_nuit_CE1.pdf", "url": "https://.../f/abc.pdf" },
+    { "nom": "Exercices_jour_nuit_CE1.pdf",          "url": "https://.../f/def.pdf" },
+    { "nom": "Evaluation_jour_nuit_CE1.pdf",         "url": "https://.../f/ghi.pdf" }
+  ]
+}
+```
+
+Chaque `url` doit être **téléchargeable** (l'interface fait un lien `download`).
+
+## Côté serveur : relier l'API à l'agent
+
+Ton endpoint reçoit le JSON, appelle l'agent (réutilise la logique de
+`agent_runner.py`), récupère les fichiers produits dans `kit/sorties/`, les expose
+à des URLs publiques (ou pré-signées), et renvoie la liste.
+
+Exemple minimal (FastAPI) :
+
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import agent_runner   # le module du kit
+
+app = FastAPI()
+
+# CORS : autorise l'origine de ta page web (sinon le navigateur bloque l'appel)
+app.add_middleware(CORSMiddleware, allow_origins=["https://ton-site.fr"],
+                   allow_methods=["POST"], allow_headers=["*"])
+
+class Demande(BaseModel):
+    discipline: str; sequence: str; niveau: str; seances: int
+    produits: list[str]; format: str; typographie: str
+    detail: str; differenciation: str; demande: str
+
+@app.post("/generer")
+def generer(d: Demande):
+    # 1. Lancer l'agent avec d.demande (réutilise lancer_agent du runner)
+    agent_runner.lancer_agent(d.demande)
+    # 2. Récupérer les fichiers produits dans kit/sorties/
+    from pathlib import Path
+    sorties = Path(agent_runner.SORTIES_DIR)
+    fichiers = [
+        {"nom": f.name, "url": f"https://ton-site.fr/fichiers/{f.name}"}
+        for f in sorties.glob("*.pdf")
+    ]
+    return {"fichiers": fichiers}
+```
+
+## Points d'attention
+
+- **CORS** : si l'interface est servie depuis un autre domaine que l'API, configure
+  les en-têtes CORS côté serveur, sinon le navigateur bloque la requête.
+- **Authentification** : ajoute ta clé/token dans `API_CONFIG.headers` côté interface
+  et vérifie-la côté serveur.
+- **Asynchrone** : si la génération est longue, renvoie d'abord un identifiant de job
+  et fais interroger l'interface (adapter le code ; le contrat ci-dessus est synchrone).
+- **Sécurité d'exécution** : `agent_runner.py` exécute du code — voir l'avertissement
+  d'isolation dans ce fichier avant toute exposition publique.
+- **Mode démonstration** : l'interface a une case « Appeler mon API réelle ». Décochée,
+  elle simule la réponse (utile pour tester l'UI sans serveur).
+```

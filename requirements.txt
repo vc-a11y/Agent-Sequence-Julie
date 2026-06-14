@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+============================================================================
+ Assistant Sequences Cycle 2 — Orchestrateur Python (Option B : serveur local)
+============================================================================
+Cet agent dialogue avec l'API Claude. Quand Claude veut produire une fiche,
+il renvoie un appel a l'outil `executer_python` ; CE script execute le code
+dans l'environnement local (ou le kit, weasyprint, les polices et LibreOffice
+sont installes), puis renvoie le resultat a Claude. Boucle jusqu'a la fin.
+
+PRE-REQUIS (a installer une fois sur la machine) :
+    pip install anthropic weasyprint cairosvg
+    # LibreOffice (pour DOCX->PDF) : apt-get install libreoffice  (ou equivalent)
+    # Polices du kit :
+    mkdir -p ~/.fonts && cp kit/polices/*.ttf ~/.fonts/ && fc-cache -f
+    # Variables d'environnement :
+    export ANTHROPIC_API_KEY="sk-ant-..."
+
+LANCEMENT :
+    python agent_runner.py "Cree une sequence sur le jour et la nuit en CE1."
+    # ou sans argument pour un mode interactif.
+
+IMPORTANT — SECURITE :
+    Ce script execute du code genere par le modele. La fonction executer_python()
+    ci-dessous le lance dans un sous-processus avec un repertoire de travail dedie.
+    EN PRODUCTION, renforce l'isolation : conteneur jetable (Docker), utilisateur
+    sans privileges, pas d'acces reseau, pas de secrets dans l'environnement,
+    quotas CPU/memoire/temps. Ne deploie jamais tel quel sur une machine sensible.
+
+IMPORTANT — IDENTIFIANTS A VERIFIER :
+    Le nom du modele (MODEL) et le format des blocs de reponse peuvent evoluer.
+    Verifie platform.claude.com/docs avant la mise en production.
+============================================================================
+"""
+
+import os
+import sys
+import subprocess
+import tempfile
+import textwrap
+import json
+from pathlib import Path
+
+import anthropic
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+MODEL = "claude-opus-4-8"          # <-- a verifier sur platform.claude.com/docs
+MAX_TOKENS = 8000
+KIT_DIR = Path(__file__).resolve().parent          # le script vit a cote du dossier kit/
+INSTRUCTIONS_PATH = KIT_DIR / "agent" / "INSTRUCTIONS_AGENT.md"
+GENERATEURS_DIR = KIT_DIR / "generateurs"
+GABARITS_DIR = KIT_DIR / "gabarits"
+POLICES_DIR = KIT_DIR / "polices"
+SORTIES_DIR = KIT_DIR / "sorties"                  # les fiches produites atterrissent ici
+SORTIES_DIR.mkdir(exist_ok=True)
+
+CODE_TIMEOUT = 120                                 # secondes max par execution de code
+
+
+# ---------------------------------------------------------------------------
+# Chargement du system prompt (instructions de l'agent)
+# ---------------------------------------------------------------------------
+def charger_system_prompt() -> str:
+    if not INSTRUCTIONS_PATH.exists():
+        sys.exit(f"ERREUR : instructions introuvables : {INSTRUCTIONS_PATH}")
+    prompt = INSTRUCTIONS_PATH.read_text(encoding="utf-8")
+    # On complete par un rappel technique sur l'environnement disponible.
+    prompt += textwrap.dedent(f"""
+
+    ---
+    ENVIRONNEMENT TECHNIQUE (rappel pour la production de fichiers) :
+    - Tu disposes de l'outil `executer_python` pour generer les fiches.
+    - Sont deja installes : weasyprint, cairosvg, LibreOffice, et les polices
+      (Patrick Hand, Baloo 2, Fredoka, Nunito).
+    - Les modules du kit sont importables :
+        * `generateurs/illustrations.py`  -> illustrations vectorielles
+        * `gabarits/gabarits.py`          -> chartes A et B + briques d'exercices
+      Ajoute leurs dossiers au sys.path en debut de code :
+        import sys
+        sys.path.insert(0, r"{GENERATEURS_DIR}")
+        sys.path.insert(0, r"{GABARITS_DIR}")
+        import os; os.environ["KIT_FONTS"] = r"{POLICES_DIR}"
+    - ECRIS TOUJOURS les fichiers finaux (PDF/DOCX) dans le dossier : {SORTIES_DIR}
+    - A la fin de ton code, imprime la liste des chemins crees, un par ligne,
+      prefixes par "FICHIER:" (ex: print("FICHIER:", chemin)).
+    """)
+    return prompt
+
+
+# ---------------------------------------------------------------------------
+# Definition de l'outil expose a Claude
+# ---------------------------------------------------------------------------
+TOOLS = [{
+    "name": "executer_python",
+    "description": (
+        "Execute du code Python dans l'environnement local du kit "
+        "(illustrations.py, gabarits.py, weasyprint, cairosvg, LibreOffice, polices). "
+        "Utilise-le pour generer les illustrations et les fiches (PDF/DOCX). "
+        "Ecris les fichiers finaux dans le dossier de sorties indique, et imprime "
+        "chaque chemin cree prefixe par 'FICHIER:'. Retourne stdout/stderr."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string", "description": "Le code Python a executer."}
+        },
+        "required": ["code"],
+    },
+}]
+
+
+# ---------------------------------------------------------------------------
+# Execution du code (a ISOLER davantage en production — voir avertissement)
+# ---------------------------------------------------------------------------
+def executer_python(code: str) -> str:
+    """
+    Lance le code dans un sous-processus Python dedie, avec un timeout.
+    Retourne un texte (stdout + stderr + liste des fichiers) destine a Claude.
+
+    PRODUCTION : remplace ce corps par un appel a un conteneur jetable isole.
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False,
+                                     dir=str(SORTIES_DIR), encoding="utf-8") as f:
+        f.write(code)
+        script_path = f.name
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, script_path],
+            capture_output=True, text=True, timeout=CODE_TIMEOUT,
+            cwd=str(SORTIES_DIR),
+        )
+        sortie = ""
+        if proc.stdout:
+            sortie += "STDOUT:\n" + proc.stdout.strip() + "\n"
+        if proc.stderr:
+            sortie += "STDERR:\n" + proc.stderr.strip() + "\n"
+        if proc.returncode != 0:
+            sortie += f"(Code de retour : {proc.returncode})\n"
+        if not sortie.strip():
+            sortie = "(aucune sortie)"
+        return sortie[:6000]   # on borne pour ne pas saturer le contexte
+    except subprocess.TimeoutExpired:
+        return f"ERREUR : execution interrompue (timeout {CODE_TIMEOUT}s)."
+    except Exception as e:
+        return f"ERREUR lors de l'execution : {e}"
+    finally:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Extraction du texte et des appels d'outils dans une reponse Claude
+# ---------------------------------------------------------------------------
+def bloc_texte(content) -> str:
+    return "\n".join(b.text for b in content if getattr(b, "type", None) == "text")
+
+def appels_outils(content):
+    return [b for b in content if getattr(b, "type", None) == "tool_use"]
+
+
+# ---------------------------------------------------------------------------
+# Boucle d'orchestration principale
+# ---------------------------------------------------------------------------
+def lancer_agent(demande_initiale: str):
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    system_prompt = charger_system_prompt()
+    messages = [{"role": "user", "content": demande_initiale}]
+
+    while True:
+        resp = client.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            system=system_prompt,
+            tools=TOOLS,
+            messages=messages,
+        )
+        messages.append({"role": "assistant", "content": resp.content})
+
+        # Afficher ce que l'agent dit (cases a choix, explications, etc.)
+        texte = bloc_texte(resp.content)
+        if texte.strip():
+            print("\n=== AGENT ===\n" + texte + "\n")
+
+        calls = appels_outils(resp.content)
+        if not calls:
+            # Pas d'outil appele : l'agent attend une reponse de l'utilisateur
+            # (ex. il vient de poser ses cases a choix) ou a termine.
+            return messages
+
+        # Executer chaque appel d'outil et renvoyer les resultats
+        results = []
+        for call in calls:
+            if call.name == "executer_python":
+                print(f"[exec] Claude execute du code ({len(call.input['code'])} caracteres)...")
+                sortie = executer_python(call.input["code"])
+                # Reperer les fichiers produits
+                for ligne in sortie.splitlines():
+                    if ligne.startswith("FICHIER:"):
+                        print("  -> produit :", ligne.replace("FICHIER:", "").strip())
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": call.id,
+                    "content": sortie,
+                })
+            else:
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": call.id,
+                    "content": f"Outil inconnu : {call.name}",
+                    "is_error": True,
+                })
+        messages.append({"role": "user", "content": results})
+
+
+# ---------------------------------------------------------------------------
+# Point d'entree : une demande passee en argument, sinon mode interactif
+# ---------------------------------------------------------------------------
+def main():
+    if "ANTHROPIC_API_KEY" not in os.environ:
+        sys.exit("ERREUR : definis la variable d'environnement ANTHROPIC_API_KEY.")
+
+    if len(sys.argv) > 1:
+        demande = " ".join(sys.argv[1:])
+        messages = lancer_agent(demande)
+    else:
+        print("Assistant Sequences Cycle 2 — tape ta demande (ou 'quitter').")
+        messages = None
+        while True:
+            try:
+                saisie = input("\nJulie > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if saisie.lower() in {"quitter", "quit", "exit"}:
+                break
+            if not saisie:
+                continue
+            if messages is None:
+                messages = lancer_agent(saisie)
+            else:
+                # Poursuivre la meme conversation (multi-tours)
+                messages.append({"role": "user", "content": saisie})
+                messages = _poursuivre(messages)
+
+    print(f"\nLes fichiers produits sont dans : {SORTIES_DIR}")
+
+
+def _poursuivre(messages):
+    """Relance la boucle d'orchestration sur un historique existant."""
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    system_prompt = charger_system_prompt()
+    while True:
+        resp = client.messages.create(
+            model=MODEL, max_tokens=MAX_TOKENS, system=system_prompt,
+            tools=TOOLS, messages=messages,
+        )
+        messages.append({"role": "assistant", "content": resp.content})
+        texte = bloc_texte(resp.content)
+        if texte.strip():
+            print("\n=== AGENT ===\n" + texte + "\n")
+        calls = appels_outils(resp.content)
+        if not calls:
+            return messages
+        results = []
+        for call in calls:
+            if call.name == "executer_python":
+                print(f"[exec] code ({len(call.input['code'])} car.)...")
+                sortie = executer_python(call.input["code"])
+                for ligne in sortie.splitlines():
+                    if ligne.startswith("FICHIER:"):
+                        print("  -> produit :", ligne.replace("FICHIER:", "").strip())
+                results.append({"type": "tool_result", "tool_use_id": call.id, "content": sortie})
+        messages.append({"role": "user", "content": results})
+
+
+if __name__ == "__main__":
+    main()

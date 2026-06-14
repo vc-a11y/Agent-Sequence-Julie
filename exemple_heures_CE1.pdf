@@ -1,0 +1,267 @@
+# Installation via l'API Claude — Assistant Séquences Cycle 2
+
+Ce guide explique comment mettre l'agent en service **via l'API Claude**.
+Il s'adresse à la personne qui code l'intégration (toi ou un développeur).
+
+---
+
+## 1. Vue d'ensemble
+
+L'agent = **un appel à l'API Claude** avec :
+- le **system prompt** = contenu de `agent/INSTRUCTIONS_AGENT.md` ;
+- un **outil d'exécution de code** (pour produire SVG / PDF / Word) ;
+- les **fichiers du kit** (`illustrations.py`, `gabarits.py`, polices) accessibles
+  dans l'environnement d'exécution.
+
+Deux façons de fournir l'exécution de code. **L'option A est recommandée.**
+
+| Option | Exécution du code | Effort | Recommandé |
+|--------|-------------------|--------|------------|
+| **A** | Outil **Code Execution** d'Anthropic (sandbox géré) | Faible | ✅ pour la plupart des cas |
+| **B** | Ton propre serveur exécute le code (tool use classique) | Élevé | si bibliothèques/polices à installer librement |
+
+> Les noms d'outils, versions de modèles et entêtes beta évoluent. Vérifie la
+> page officielle **platform.claude.com/docs** (section *Tools / Code Execution* et
+> *Tool reference*) avant de coder, et adapte les identifiants ci-dessous si besoin.
+
+### ⚠️ Deux contraintes vérifiées du sandbox Code Execution (à lire avant de choisir)
+
+1. **Pas d'accès internet dans le sandbox.** Le conteneur d'exécution d'Anthropic
+   n'a **pas** d'accès réseau. Tu ne peux donc **pas** faire `pip install weasyprint`
+   ou télécharger des polices à la volée depuis le sandbox. Conséquence :
+   - soit les bibliothèques nécessaires (cairosvg, et un moteur HTML→PDF ou DOCX→PDF)
+     sont **déjà préinstallées** dans le conteneur — **à vérifier** sur la page
+     *Code execution tool* (liste des paquets préinstallés du conteneur) ;
+   - soit tu **téléverses** ce qui manque (kit + polices, et au besoin des paquets)
+     via la **Files API**, qui les rend disponibles dans le conteneur ;
+   - soit, si le moteur PDF voulu n'est pas dispo et non téléversable proprement,
+     tu passes par l'**option B** (ton serveur), où tu installes tout librement.
+
+2. **Versions de l'outil.** Il existe plusieurs versions :
+   - `code_execution_20250522` : **Python uniquement** (legacy) ;
+   - `code_execution_20250825` : ajoute **Bash et les opérations sur fichiers** ;
+   - des versions plus récentes ajoutent d'autres capacités.
+   Pour cet agent (installation de polices, manipulation de fichiers, conversion PDF),
+   **choisis une version qui inclut Bash + opérations fichiers**, et prends l'entête
+   `anthropic-beta` correspondante indiquée dans la doc.
+
+---
+
+## 2. Pré-requis
+
+- Une **clé API** Anthropic (variable d'environnement `ANTHROPIC_API_KEY`).
+- Le SDK : `pip install anthropic`
+- Le contenu du kit : `INSTRUCTIONS_AGENT.md`, `illustrations.py`, `gabarits.py`,
+  le dossier `polices/`.
+
+---
+
+## 3. Option A — avec l'outil Code Execution (recommandé)
+
+### Principe
+Anthropic exécute le Python dans un sandbox. Tu lui fournis les fichiers du kit ;
+Claude écrit et lance le code qui génère les fiches, puis te renvoie les fichiers.
+
+### Étapes
+1. **Téléverser les fichiers du kit** dans l'espace de fichiers de l'API
+   (Files API), pour qu'ils soient disponibles dans le sandbox d'exécution :
+   `illustrations.py`, `gabarits.py`, et les 4 `.ttf` de `polices/`.
+2. **Installer les polices** au début de chaque session : copier les `.ttf`
+   dans `~/.fonts` puis `fc-cache -f` (Claude le fera s'il est instruit ; c'est
+   déjà induit par les instructions de l'agent, mais tu peux l'imposer en préambule).
+3. **Appeler l'API** avec le system prompt + l'outil code execution activé.
+
+### Squelette de code (Python)
+
+```python
+import os, anthropic
+
+client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+# 1. Charger le system prompt depuis le fichier du kit
+with open("agent/INSTRUCTIONS_AGENT.md", encoding="utf-8") as f:
+    SYSTEM_PROMPT = f.read()
+
+# 2. (Pré-requis) téléverser illustrations.py, gabarits.py et les polices via la Files API,
+#    puis récupérer leurs file_id. Voir docs.claude.com > Files API.
+#    Ces fichiers doivent être rendus disponibles au conteneur d'exécution de code.
+
+# 3. Préambule technique injecté en tête de conversation pour préparer l'environnement
+#    IMPORTANT : le sandbox n'a PAS d'accès internet. Ne demande aucune installation
+#    depuis internet. Suppose les paquets préinstallés ou téléversés via la Files API.
+SETUP = (
+    "Les modules illustrations.py et gabarits.py du kit, ainsi que les polices .ttf, "
+    "sont déjà disponibles dans l'environnement (ne télécharge rien depuis internet). "
+    "Copie les .ttf dans ~/.fonts puis lance fc-cache -f. Importe illustrations.py et "
+    "gabarits.py. Utilise les gabarits charte_a / charte_b pour les supports élèves. "
+    "Si une bibliothèque PDF nécessaire manque, signale-le au lieu de tenter une installation."
+)
+
+resp = client.beta.messages.create(
+    model="claude-opus-4-8",          # vérifier le dernier identifiant sur platform.claude.com/docs
+    max_tokens=8000,
+    system=SYSTEM_PROMPT,
+    # Choisir une version avec Bash + opérations fichiers (ex. ci-dessous) ; vérifier la doc :
+    tools=[{"type": "code_execution_20250825", "name": "code_execution"}],
+    betas=["code-execution-2025-08-25"],  # entête beta correspondant à la version choisie
+    messages=[
+        {"role": "user", "content": SETUP},
+        {"role": "user", "content": "Crée-moi une séquence sur le jour et la nuit en CE1."},
+    ],
+)
+
+# La réponse contient le texte de Claude + les fichiers générés (à récupérer
+# selon le format renvoyé par l'outil : blocs de résultat / file_id de sortie).
+print(resp)
+```
+
+> ⚠️ **Rappel internet** : dans le sandbox, pas de `pip install` ni de téléchargement.
+> Le préambule SETUP ne doit donc PAS demander d'installer via internet : il doit
+> supposer les paquets **préinstallés** ou **téléversés via la Files API**. Adapte le
+> texte de SETUP en conséquence (par exemple : « les polices .ttf et les modules
+> illustrations.py / gabarits.py sont déjà disponibles dans /mnt ; copie les .ttf
+> dans ~/.fonts et lance fc-cache -f ; n'installe rien depuis internet »).
+
+### Récupération des fichiers produits
+Selon la version de l'outil, les fichiers générés sont renvoyés soit comme
+**file_id** (à télécharger via la Files API), soit comme blocs joints à la réponse.
+Récupère-les et présente-les à Julie (téléchargement / affichage).
+
+---
+
+## 4. Option B — ton serveur exécute le code (tool use classique)
+
+À utiliser si tu ne veux pas du sandbox Anthropic (ex. environnement interne maîtrisé).
+
+### Principe
+Tu déclares un outil `executer_python`. Quand Claude veut produire une fiche, il
+renvoie un `tool_use` avec le code à exécuter ; **ton serveur l'exécute** dans un
+environnement où le kit + weasyprint + cairosvg + LibreOffice + polices sont installés,
+puis tu renvoies le résultat (chemins/fichiers) dans un `tool_result`.
+
+### Déclaration de l'outil
+
+```python
+tools = [{
+    "name": "executer_python",
+    "description": "Exécute du code Python dans l'environnement du kit "
+                   "(illustrations.py, gabarits.py, weasyprint, polices installées). "
+                   "Retourne les chemins des fichiers générés.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string", "description": "Code Python à exécuter."}
+        },
+        "required": ["code"],
+    },
+}]
+```
+
+### Boucle d'orchestration (pseudo-code)
+
+```python
+messages = [{"role": "user", "content": "Crée une séquence sur le jour et la nuit en CE1."}]
+while True:
+    resp = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=8000,
+        system=SYSTEM_PROMPT,
+        tools=tools,
+        messages=messages,
+    )
+    messages.append({"role": "assistant", "content": resp.content})
+
+    tool_calls = [b for b in resp.content if getattr(b, "type", None) == "tool_use"]
+    if not tool_calls:
+        break  # Claude a fini (ou pose ses cases à choix)
+
+    results = []
+    for call in tool_calls:
+        if call.name == "executer_python":
+            sortie = run_in_sandbox(call.input["code"])  # À TOI de l'implémenter (sandbox sûr !)
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": call.id,
+                "content": sortie,  # ex. liste des fichiers générés / logs
+            })
+    messages.append({"role": "user", "content": results})
+```
+
+### Environnement à préparer sur ton serveur
+```bash
+pip install weasyprint cairosvg anthropic
+# LibreOffice pour DOCX -> PDF (si format Word demandé)
+mkdir -p ~/.fonts && cp polices/*.ttf ~/.fonts/ && fc-cache -f
+# placer illustrations.py et gabarits.py dans le PYTHONPATH du sandbox
+```
+
+> ⚠️ **Sécurité** : n'exécute jamais du code arbitraire sans isolation. Utilise un
+> conteneur jetable / un sandbox restreint, sans accès réseau ni secrets.
+
+---
+
+## 5. Vérification de mise en service
+
+1. Lance l'agent avec : *« Crée une séquence sur le jour et la nuit en CE1. »*
+2. Attendu : l'agent **pose d'abord ses cases à choix** (séances, format, détail,
+   différenciation).
+3. Réponds aux choix → l'agent doit produire **3 PDF** (prép, exercices, évaluation)
+   avec illustrations, titre travaillé, et page de découpe séparée.
+4. Si les PDF ne sortent pas : vérifie weasyprint, les polices (`fc-list | grep -i patrick`)
+   et l'accès du sandbox aux fichiers du kit.
+
+---
+
+## 5 bis. Script prêt à l'emploi (Option B) — `agent_runner.py`
+
+Le kit inclut un **orchestrateur Python complet et testé** : `agent_runner.py`.
+Il charge les instructions, expose l'outil `executer_python`, fait tourner la
+boucle de dialogue avec Claude, exécute le code de génération dans un
+sous-processus, et récupère les fiches dans `kit/sorties/`.
+
+### Démarrage rapide
+```bash
+# 1. Dépendances Python
+pip install -r requirements.txt
+
+# 2. Dépendances système (Debian/Ubuntu) — LibreOffice + libs weasyprint
+sudo apt-get install -y libreoffice libpango-1.0-0 libpangocairo-1.0-0 \
+     libgdk-pixbuf2.0-0 libffi-dev
+
+# 3. Polices du kit
+mkdir -p ~/.fonts && cp polices/*.ttf ~/.fonts/ && fc-cache -f
+
+# 4. Clé API
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+# 5. Lancer l'agent
+python agent_runner.py "Crée une séquence sur le jour et la nuit en CE1."
+#   ou, sans argument, pour un mode interactif multi-tours :
+python agent_runner.py
+```
+
+### Ce que le script fait
+1. Envoie la demande à Claude avec le system prompt de l'agent.
+2. Si Claude pose ses **cases à choix**, le texte s'affiche et tu réponds
+   (mode interactif) ou tu relances avec la précision.
+3. Quand Claude génère une fiche, il appelle `executer_python` → le script
+   exécute le code dans `kit/sorties/` et renvoie le résultat à Claude.
+4. Les PDF/DOCX produits apparaissent dans `kit/sorties/`.
+
+### Avant la production — à régler dans `agent_runner.py`
+- **`MODEL`** : vérifier l'identifiant courant du modèle.
+- **`executer_python()`** : remplacer le sous-processus par un **conteneur
+  jetable isolé** (sans réseau ni secrets, quotas CPU/mémoire/temps).
+- **`CODE_TIMEOUT`** : ajuster si les fiches complexes dépassent 120 s.
+
+---
+
+## 6. Réglages utiles
+
+- **max_tokens** : prévoir large (≥ 8000) car l'agent écrit la séquence + le code.
+- **Police cursive Script École** : non incluse (licence). Pour des modèles d'écriture
+  en cursive, fournir le `.ttf` dans `~/.fonts` ou générer en Word (voir README).
+- **Mémoire / multi-tours** : conserver l'historique `messages` pour que l'agent
+  enchaîne cadrage → production → ajustements.
+- **Coût** : la génération de fichiers consomme des tokens (code + sortie). Limiter
+  la production aux livrables demandés via la case « Que dois-je produire ? ».
